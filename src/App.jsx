@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
-import { toPng } from 'html-to-image'
+import { toBlob } from 'html-to-image'
 import {
   Archive, ArrowLeftRight, Camera, Check, Download, Film, FolderOpen, ImagePlus,
   Layers3, Maximize2, Move, Redo2, RotateCcw, RotateCw, Save, Settings2,
@@ -63,19 +63,60 @@ const initialProject = {
 
 const makeId = () => globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`
 
-const fileToDataUrl = (file) => new Promise((resolve, reject) => {
+const blobToDataUrl = (blob) => new Promise((resolve, reject) => {
   const reader = new FileReader()
   reader.onload = () => resolve(reader.result)
   reader.onerror = reject
-  reader.readAsDataURL(file)
+  reader.readAsDataURL(blob)
 })
+
+const dataUrlToBlob = (dataUrl) => {
+  const [header, encoded = ''] = dataUrl.split(',', 2)
+  const mime = header.match(/^data:([^;,]+)/)?.[1] || 'application/octet-stream'
+  const binary = atob(encoded)
+  const bytes = new Uint8Array(binary.length)
+  for (let index = 0; index < binary.length; index += 1) bytes[index] = binary.charCodeAt(index)
+  return new Blob([bytes], { type: mime })
+}
+
+const isObjectUrl = (url) => typeof url === 'string' && url.startsWith('blob:')
 
 const getImageSize = (url) => new Promise((resolve) => {
   const image = new Image()
-  image.onload = () => resolve({ width: image.naturalWidth, height: image.naturalHeight })
-  image.onerror = () => resolve({ width: 0, height: 0 })
+  const finish = (size) => {
+    image.onload = null
+    image.onerror = null
+    resolve(size)
+  }
+  image.onload = () => finish({ width: image.naturalWidth, height: image.naturalHeight })
+  image.onerror = () => finish({ width: 0, height: 0 })
   image.src = url
 })
+
+const hydratePhoto = async (photo) => {
+  let blob = photo?.blob instanceof Blob ? photo.blob : null
+  if (!blob && typeof photo?.url === 'string' && photo.url.startsWith('data:')) {
+    blob = dataUrlToBlob(photo.url)
+  }
+
+  if (!blob) return { ...photo, transform: withoutVerticalTransform(photo?.transform) }
+
+  const url = URL.createObjectURL(blob)
+  const size = photo.width && photo.height ? { width: photo.width, height: photo.height } : await getImageSize(url)
+  return {
+    ...photo,
+    ...size,
+    blob,
+    url,
+    transform: withoutVerticalTransform(photo?.transform),
+  }
+}
+
+const revokePhotoUrls = (items) => {
+  for (const photo of items || []) {
+    if (isObjectUrl(photo?.url)) URL.revokeObjectURL(photo.url)
+  }
+}
 
 const openDatabase = () => new Promise((resolve, reject) => {
   const request = indexedDB.open('retro-memory-studio', 1)
@@ -93,28 +134,115 @@ const dbAction = async (mode, action) => {
     const tx = db.transaction('projects', mode)
     const store = tx.objectStore('projects')
     const request = action(store)
-    request.onsuccess = () => resolve(request.result)
-    request.onerror = () => reject(request.error)
-    tx.oncomplete = () => db.close()
+    let settled = false
+
+    const closeDb = () => {
+      try { db.close() } catch { /* already closed */ }
+    }
+
+    request.onsuccess = () => {
+      if (settled) return
+      settled = true
+      resolve(request.result)
+    }
+    request.onerror = () => {
+      if (settled) return
+      settled = true
+      reject(request.error)
+    }
+    tx.oncomplete = closeDb
+    tx.onabort = closeDb
+    tx.onerror = closeDb
   })
 }
 
 const saveProjectToDb = (payload) => dbAction('readwrite', (store) => store.put(payload))
 const deleteProjectFromDb = (id) => dbAction('readwrite', (store) => store.delete(id))
 const loadProjectFromDb = (id) => dbAction('readonly', (store) => store.get(id))
-const listProjectsFromDb = () => dbAction('readonly', (store) => store.getAll())
+
+const listProjectSummariesFromDb = async () => {
+  const db = await openDatabase()
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction('projects', 'readonly')
+    const request = tx.objectStore('projects').openCursor()
+    const summaries = []
+    let settled = false
+
+    const closeDb = () => {
+      try { db.close() } catch { /* already closed */ }
+    }
+    const fail = (error) => {
+      if (settled) return
+      settled = true
+      reject(error)
+    }
+
+    request.onsuccess = () => {
+      const cursor = request.result
+      if (!cursor) {
+        if (!settled) {
+          settled = true
+          resolve(summaries)
+        }
+        return
+      }
+      const item = cursor.value
+      summaries.push({
+        id: item.id,
+        projectName: item.project?.projectName || 'Untitled project',
+        photoCount: Array.isArray(item.photos) ? item.photos.length : 0,
+        updatedAt: item.updatedAt || '',
+      })
+      cursor.continue()
+    }
+    request.onerror = () => fail(request.error)
+    tx.oncomplete = closeDb
+    tx.onabort = () => {
+      closeDb()
+      fail(tx.error)
+    }
+    tx.onerror = () => {
+      closeDb()
+      fail(tx.error)
+    }
+  })
+}
 
 const Slider = ({ label, value, min, max, step = 1, unit = '', onChange }) => {
-  const [draftValue, setDraftValue] = useState(String(value))
+  const [draftValue, setDraftValue] = useState(null)
+  const rangeFrameRef = useRef(null)
+  const pendingRangeValueRef = useRef(null)
 
-  useEffect(() => {
-    setDraftValue(String(value))
-  }, [value])
+  useEffect(() => () => {
+    if (rangeFrameRef.current) window.cancelAnimationFrame(rangeFrameRef.current)
+  }, [])
+
+  const scheduleRangeValue = (nextValue) => {
+    pendingRangeValueRef.current = nextValue
+    if (rangeFrameRef.current) return
+    rangeFrameRef.current = window.requestAnimationFrame(() => {
+      rangeFrameRef.current = null
+      const pending = pendingRangeValueRef.current
+      pendingRangeValueRef.current = null
+      if (pending !== null) onChange(pending)
+    })
+  }
+
+  const flushRangeValue = () => {
+    if (rangeFrameRef.current) {
+      window.cancelAnimationFrame(rangeFrameRef.current)
+      rangeFrameRef.current = null
+    }
+    const pending = pendingRangeValueRef.current
+    pendingRangeValueRef.current = null
+    if (pending !== null) onChange(pending)
+  }
 
   const commitDraftValue = () => {
+    if (draftValue === null) return
     const parsed = Number(draftValue)
     if (!Number.isFinite(parsed)) {
-      setDraftValue(String(value))
+      setDraftValue(null)
       return
     }
 
@@ -122,7 +250,7 @@ const Slider = ({ label, value, min, max, step = 1, unit = '', onChange }) => {
     const precision = String(step).includes('.') ? String(step).split('.')[1].length : 0
     const normalized = precision > 0 ? Number(clamped.toFixed(precision)) : Math.round(clamped)
     onChange(normalized)
-    setDraftValue(String(normalized))
+    setDraftValue(null)
   }
 
   return (
@@ -135,7 +263,8 @@ const Slider = ({ label, value, min, max, step = 1, unit = '', onChange }) => {
             min={min}
             max={max}
             step={step}
-            value={draftValue}
+            value={draftValue ?? String(value)}
+            onFocus={() => setDraftValue(String(value))}
             onChange={(event) => setDraftValue(event.target.value)}
             onBlur={commitDraftValue}
             onKeyDown={(event) => {
@@ -144,7 +273,7 @@ const Slider = ({ label, value, min, max, step = 1, unit = '', onChange }) => {
                 event.currentTarget.blur()
               }
               if (event.key === 'Escape') {
-                setDraftValue(String(value))
+                setDraftValue(null)
                 event.currentTarget.blur()
               }
             }}
@@ -159,7 +288,10 @@ const Slider = ({ label, value, min, max, step = 1, unit = '', onChange }) => {
         max={max}
         step={step}
         value={value}
-        onChange={(event) => onChange(Number(event.target.value))}
+        onChange={(event) => scheduleRangeValue(Number(event.target.value))}
+        onPointerUp={flushRangeValue}
+        onPointerCancel={flushRangeValue}
+        onBlur={flushRangeValue}
       />
     </label>
   )
@@ -181,9 +313,18 @@ function App() {
   const [positionEditor, setPositionEditor] = useState(null)
   const [editorDrag, setEditorDrag] = useState(null)
   const [editorResize, setEditorResize] = useState(null)
+  const [isExporting, setIsExporting] = useState(false)
   const cardRef = useRef(null)
   const rollRef = useRef(null)
   const importRef = useRef(null)
+  const noticeTimeoutRef = useRef(null)
+  const exportUrlRef = useRef(null)
+  const exportInProgressRef = useRef(false)
+  const photosRef = useRef([])
+  const photoTransformFrameRef = useRef(null)
+  const pendingPhotoTransformRef = useRef(null)
+  const editorTransformFrameRef = useRef(null)
+  const pendingEditorTransformRef = useRef(null)
 
   const selectedPhoto = photos.find((photo) => photo.id === selectedPhotoId) || photos[0] || null
   const selectedTransform = withoutVerticalTransform(selectedPhoto?.transform || project.transform)
@@ -195,11 +336,22 @@ function App() {
 
   useEffect(() => { refreshProjects() }, [])
   useEffect(() => { localStorage.setItem('retro-memory-presets', JSON.stringify(customPresets)) }, [customPresets])
+  useEffect(() => { photosRef.current = photos }, [photos])
+  useEffect(() => () => {
+    if (noticeTimeoutRef.current) window.clearTimeout(noticeTimeoutRef.current)
+    if (exportUrlRef.current) URL.revokeObjectURL(exportUrlRef.current)
+    if (photoTransformFrameRef.current) window.cancelAnimationFrame(photoTransformFrameRef.current)
+    if (editorTransformFrameRef.current) window.cancelAnimationFrame(editorTransformFrameRef.current)
+    revokePhotoUrls(photosRef.current)
+  }, [])
 
   const flash = (message) => {
     setNotice(message)
-    window.clearTimeout(flash.timeout)
-    flash.timeout = window.setTimeout(() => setNotice(''), 2200)
+    if (noticeTimeoutRef.current) window.clearTimeout(noticeTimeoutRef.current)
+    noticeTimeoutRef.current = window.setTimeout(() => {
+      setNotice('')
+      noticeTimeoutRef.current = null
+    }, 2200)
   }
 
   const commitProject = (next) => {
@@ -211,7 +363,7 @@ function App() {
   const patchProject = (patch) => commitProject({ ...project, ...patch })
   const patchFilm = (patch) => commitProject({ ...project, film: { ...project.film, ...patch } })
 
-  const normalizeTransformForPhoto = (photo, currentTransform, patch) => {
+  const normalizeTransform = (currentTransform, patch) => {
     const next = { ...(currentTransform || defaultTransform), ...patch }
     next.zoom = Math.max(1, next.zoom || 1)
     delete next.y
@@ -225,14 +377,38 @@ function App() {
       photo.id === photoId
         ? {
           ...photo,
-          transform: normalizeTransformForPhoto(
-            photo,
+          transform: normalizeTransform(
             photo.transform || project.transform || defaultTransform,
             patch,
           ),
         }
         : photo
     )))
+  }
+
+  const schedulePhotoTransform = (photoId, patch) => {
+    const pending = pendingPhotoTransformRef.current
+    pendingPhotoTransformRef.current = pending?.photoId === photoId
+      ? { photoId, patch: { ...pending.patch, ...patch } }
+      : { photoId, patch }
+
+    if (photoTransformFrameRef.current) return
+    photoTransformFrameRef.current = window.requestAnimationFrame(() => {
+      photoTransformFrameRef.current = null
+      const next = pendingPhotoTransformRef.current
+      pendingPhotoTransformRef.current = null
+      if (next) patchPhotoTransform(next.photoId, next.patch)
+    })
+  }
+
+  const flushPhotoTransform = () => {
+    if (photoTransformFrameRef.current) {
+      window.cancelAnimationFrame(photoTransformFrameRef.current)
+      photoTransformFrameRef.current = null
+    }
+    const next = pendingPhotoTransformRef.current
+    pendingPhotoTransformRef.current = null
+    if (next) patchPhotoTransform(next.photoId, next.patch)
   }
 
   const patchSelectedTransform = (patch) => patchPhotoTransform(selectedPhoto?.id, patch)
@@ -255,8 +431,8 @@ function App() {
 
   const refreshProjects = async () => {
     try {
-      const items = await listProjectsFromDb()
-      setSavedProjects(items.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || '')))
+      const summaries = await listProjectSummariesFromDb()
+      setSavedProjects(summaries.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)))
     } catch { setSavedProjects([]) }
   }
 
@@ -265,10 +441,10 @@ function App() {
     if (!files.length) return
     const nextPhotos = []
     for (const file of files) {
-      const url = await fileToDataUrl(file)
+      const url = URL.createObjectURL(file)
       const size = await getImageSize(url)
       nextPhotos.push({
-        id: makeId(), url, name: file.name, type: file.type, bytes: file.size,
+        id: makeId(), url, blob: file, name: file.name, type: file.type, bytes: file.size,
         lastModified: file.lastModified, ...size, transform: { ...defaultTransform },
       })
     }
@@ -279,6 +455,8 @@ function App() {
   }
 
   const removePhoto = (id) => {
+    const removed = photos.find((photo) => photo.id === id)
+    if (removed && isObjectUrl(removed.url)) URL.revokeObjectURL(removed.url)
     const remaining = photos.filter((photo) => photo.id !== id)
     setPhotos(remaining)
     if (selectedPhotoId === id) setSelectedPhotoId(remaining[0]?.id || null)
@@ -297,7 +475,12 @@ function App() {
     const id = project.id || makeId()
     const normalized = { ...project, id }
     const cleanPhotos = photos.map((photo) => ({ ...photo, transform: withoutVerticalTransform(photo.transform) }))
-    const payload = { id, project: normalized, photos: cleanPhotos, selectedPhotoId, updatedAt: new Date().toISOString() }
+    const storedPhotos = cleanPhotos.map((photo) => {
+      const stored = { ...photo }
+      delete stored.url
+      return stored
+    })
+    const payload = { id, project: normalized, photos: storedPhotos, selectedPhotoId, updatedAt: new Date().toISOString() }
     setPhotos(cleanPhotos)
     setProject(normalized)
     await saveProjectToDb(payload)
@@ -308,12 +491,14 @@ function App() {
   const openSavedProject = async (id) => {
     const payload = await loadProjectFromDb(id)
     if (!payload) return
-    setProject(payload.project)
-    setPhotos((payload.photos || []).map((photo) => ({
+    const hydratedPhotos = await Promise.all((payload.photos || []).map((photo) => hydratePhoto({
       ...photo,
-      transform: withoutVerticalTransform(photo.transform || payload.project?.transform),
+      transform: photo.transform || payload.project?.transform,
     })))
-    setSelectedPhotoId(payload.selectedPhotoId || payload.photos?.[0]?.id || null)
+    revokePhotoUrls(photos)
+    setProject(payload.project)
+    setPhotos(hydratedPhotos)
+    setSelectedPhotoId(payload.selectedPhotoId || hydratedPhotos[0]?.id || null)
     setPast([])
     setFuture([])
     flash('Project loaded')
@@ -326,6 +511,7 @@ function App() {
   }
 
   const newProject = () => {
+    revokePhotoUrls(photos)
     setProject({ ...initialProject, id: makeId() })
     setPhotos([])
     setSelectedPhotoId(null)
@@ -334,14 +520,18 @@ function App() {
     flash('New blank roll created')
   }
 
-  const exportJson = () => {
-    const blob = new Blob([JSON.stringify({ project, photos, selectedPhotoId }, null, 2)], { type: 'application/json' })
+  const exportJson = async () => {
+    const portablePhotos = await Promise.all(photos.map(async ({ blob: sourceBlob, url, ...photo }) => ({
+      ...photo,
+      url: sourceBlob ? await blobToDataUrl(sourceBlob) : url,
+    })))
+    const blob = new Blob([JSON.stringify({ project, photos: portablePhotos, selectedPhotoId }, null, 2)], { type: 'application/json' })
     const url = URL.createObjectURL(blob)
     const anchor = document.createElement('a')
     anchor.href = url
     anchor.download = `${project.projectName || 'retro-memory-project'}.json`
     anchor.click()
-    URL.revokeObjectURL(url)
+    window.setTimeout(() => URL.revokeObjectURL(url), 0)
   }
 
   const importJson = async (event) => {
@@ -350,12 +540,14 @@ function App() {
     try {
       const payload = JSON.parse(await file.text())
       if (!payload.project) throw new Error('Invalid project')
-      setProject({ ...initialProject, ...payload.project, id: makeId() })
-      setPhotos(Array.isArray(payload.photos) ? payload.photos.map((photo) => ({
+      const hydratedPhotos = await Promise.all((Array.isArray(payload.photos) ? payload.photos : []).map((photo) => hydratePhoto({
         ...photo,
-        transform: withoutVerticalTransform(photo.transform || payload.project?.transform),
-      })) : [])
-      setSelectedPhotoId(payload.selectedPhotoId || payload.photos?.[0]?.id || null)
+        transform: photo.transform || payload.project?.transform,
+      })))
+      revokePhotoUrls(photos)
+      setProject({ ...initialProject, ...payload.project, id: makeId() })
+      setPhotos(hydratedPhotos)
+      setSelectedPhotoId(payload.selectedPhotoId || hydratedPhotos[0]?.id || null)
       setPast([])
       setFuture([])
       flash('Project file imported')
@@ -364,14 +556,44 @@ function App() {
   }
 
   const exportArtwork = async () => {
+    if (exportInProgressRef.current) return
     const target = project.view === 'roll' ? rollRef.current : cardRef.current
     if (!target) return
-    const dataUrl = await toPng(target, { cacheBust: true, pixelRatio: 3, backgroundColor: '#efe9df' })
-    const anchor = document.createElement('a')
-    anchor.href = dataUrl
-    anchor.download = `${project.projectName || 'retro-memory'}-${project.view}.png`
-    anchor.click()
-    flash(`${project.view === 'roll' ? 'Contact sheet' : 'Card'} exported as PNG`)
+    exportInProgressRef.current = true
+    setIsExporting(true)
+
+    try {
+      const width = Math.max(1, target.scrollWidth || target.offsetWidth || 1)
+      const height = Math.max(1, target.scrollHeight || target.offsetHeight || 1)
+      const maxOutputPixels = 16_000_000
+      const pixelRatio = Math.max(1, Math.min(3, Math.sqrt(maxOutputPixels / (width * height))))
+      const blob = await toBlob(target, {
+        cacheBust: true,
+        pixelRatio,
+        backgroundColor: '#efe9df',
+      })
+      if (!blob) {
+        flash('Export could not be created')
+        return
+      }
+      if (exportUrlRef.current) URL.revokeObjectURL(exportUrlRef.current)
+      const url = URL.createObjectURL(blob)
+      exportUrlRef.current = url
+      const anchor = document.createElement('a')
+      anchor.href = url
+      anchor.download = `${project.projectName || 'retro-memory'}-${project.view}.png`
+      anchor.click()
+      window.setTimeout(() => {
+        if (exportUrlRef.current === url) {
+          URL.revokeObjectURL(url)
+          exportUrlRef.current = null
+        }
+      }, 1000)
+      flash(`${project.view === 'roll' ? 'Contact sheet' : 'Card'} exported as PNG`)
+    } finally {
+      exportInProgressRef.current = false
+      setIsExporting(false)
+    }
   }
 
   const filmStyle = (photo = selectedPhoto, transformOverride = null) => {
@@ -439,13 +661,14 @@ function App() {
   const handlePointerMove = (event) => {
     if (!dragState) return
     const dx = (event.clientX - dragState.x) / 4
-    patchPhotoTransform(dragState.photoId, {
+    schedulePhotoTransform(dragState.photoId, {
       x: Math.max(-60, Math.min(60, dragState.startX + dx)),
     })
   }
 
   const handlePointerUp = () => {
     if (!dragState) return
+    flushPhotoTransform()
     setDragState(null)
   }
 
@@ -461,15 +684,38 @@ function App() {
   const patchEditorTransform = (patch) => {
     setPositionEditor((current) => {
       if (!current) return current
-      const photo = photos.find((item) => item.id === current.photoId)
       return {
         ...current,
-        draft: normalizeTransformForPhoto(photo, current.draft, patch),
+        draft: normalizeTransform(current.draft, patch),
       }
     })
   }
 
+  const scheduleEditorTransform = (patch) => {
+    pendingEditorTransformRef.current = {
+      ...(pendingEditorTransformRef.current || {}),
+      ...patch,
+    }
+    if (editorTransformFrameRef.current) return
+
+    editorTransformFrameRef.current = window.requestAnimationFrame(() => {
+      editorTransformFrameRef.current = null
+      const next = pendingEditorTransformRef.current
+      pendingEditorTransformRef.current = null
+      if (next) patchEditorTransform(next)
+    })
+  }
+
+  const cancelScheduledEditorTransform = () => {
+    if (editorTransformFrameRef.current) {
+      window.cancelAnimationFrame(editorTransformFrameRef.current)
+      editorTransformFrameRef.current = null
+    }
+    pendingEditorTransformRef.current = null
+  }
+
   const closePositionEditor = () => {
+    cancelScheduledEditorTransform()
     setPositionEditor(null)
     setEditorDrag(null)
     setEditorResize(null)
@@ -477,7 +723,12 @@ function App() {
 
   const savePositionEditor = () => {
     if (!positionEditor) return
-    patchPhotoTransform(positionEditor.photoId, positionEditor.draft)
+    const pending = pendingEditorTransformRef.current
+    const draft = pending
+      ? normalizeTransform(positionEditor.draft, pending)
+      : positionEditor.draft
+    cancelScheduledEditorTransform()
+    patchPhotoTransform(positionEditor.photoId, draft)
     closePositionEditor()
     flash('Photo position updated')
   }
@@ -498,7 +749,7 @@ function App() {
   const handleEditorPointerMove = (event) => {
     if (!editorDrag || !positionEditor) return
     const dx = ((event.clientX - editorDrag.x) / Math.max(1, editorDrag.width)) * 140
-    patchEditorTransform({
+    scheduleEditorTransform({
       x: Math.max(-70, Math.min(70, editorDrag.startX + dx)),
     })
   }
@@ -579,7 +830,7 @@ function App() {
 
     const normalizedX = maxLeft > 0 ? (2 * targetLeft / maxLeft) - 1 : 0
 
-    patchEditorTransform({
+    scheduleEditorTransform({
       zoom: newZoom,
       x: Number((normalizedX * 70).toFixed(2)),
     })
@@ -594,7 +845,7 @@ function App() {
     if (!positionEditor) return
     event.preventDefault()
     const direction = event.deltaY > 0 ? -0.08 : 0.08
-    patchEditorTransform({
+    scheduleEditorTransform({
       zoom: Math.max(1, Math.min(5, Number((positionEditor.draft.zoom + direction).toFixed(2)))),
     })
   }
@@ -613,13 +864,13 @@ function App() {
       onDoubleClick={draggable && photo ? () => openPositionEditor(photo) : undefined}
       title={draggable && photo ? 'Double-click to position photo' : undefined}
     >
-      {photo ? <img src={photo.url} alt={photo.name || 'Memory'} style={filmStyle(photo)} draggable="false" /> : (
+      {photo ? <img src={photo.url} alt={photo.name || 'Memory'} style={filmStyle(photo)} draggable="false" decoding="async" /> : (
         <div className="empty-photo"><Camera size={38} strokeWidth={1.4} /><strong>Add a photo</strong><span>Your memory stays on this device.</span></div>
       )}
-      <div className="warmth-overlay" style={{ opacity: Math.abs(project.film.warmth) / 100, background: project.film.warmth >= 0 ? '#f29b55' : '#5f92bf' }} />
-      <div className="fade-overlay" style={{ opacity: project.film.fade / 180 }} />
-      <div className="grain-overlay" style={{ opacity: project.film.grain / 100 }} />
-      <div className="vignette-overlay" style={{ opacity: project.film.vignette / 100 }} />
+      {project.film.warmth !== 0 && <div className="warmth-overlay" style={{ opacity: Math.abs(project.film.warmth) / 100, background: project.film.warmth >= 0 ? '#f29b55' : '#5f92bf' }} />}
+      {project.film.fade > 0 && <div className="fade-overlay" style={{ opacity: project.film.fade / 180 }} />}
+      {project.film.grain > 0 && <div className="grain-overlay" style={{ opacity: project.film.grain / 100 }} />}
+      {project.film.vignette > 0 && <div className="vignette-overlay" style={{ opacity: project.film.vignette / 100 }} />}
     </div>
   )
 
@@ -665,7 +916,7 @@ function App() {
         <div className="top-actions">
           <button className="ghost-button" onClick={newProject}><RotateCcw size={16} /> New</button>
           <button className="ghost-button" onClick={saveCurrentProject}><Save size={16} /> Save</button>
-          <button className="primary-button" onClick={exportArtwork}><Download size={17} /> Export PNG</button>
+          <button className="primary-button" onClick={exportArtwork} disabled={isExporting}><Download size={17} /> {isExporting ? 'Exporting…' : 'Export PNG'}</button>
         </div>
       </header>
 
@@ -794,7 +1045,7 @@ function App() {
                     {!savedProjects.length && <p className="empty-list">No saved projects yet.</p>}
                     {savedProjects.map((item) => (
                       <div className="saved-project" key={item.id}>
-                        <button onClick={() => openSavedProject(item.id)}><strong>{item.project?.projectName || 'Untitled project'}</strong><span>{item.photos?.length || 0} photos · {item.updatedAt ? new Date(item.updatedAt).toLocaleString() : ''}</span></button>
+                        <button onClick={() => openSavedProject(item.id)}><strong>{item.projectName}</strong><span>{item.photoCount} photos · {item.updatedAt ? new Date(item.updatedAt).toLocaleString() : ''}</span></button>
                         <button className="icon-button danger" onClick={() => deleteSavedProject(item.id)} aria-label="Delete saved project"><Trash2 size={16} /></button>
                       </div>
                     ))}
@@ -860,7 +1111,7 @@ function App() {
             <div className="thumbnail-strip">
               {photos.map((photo, index) => (
                 <div key={photo.id} className={`thumbnail-card ${selectedPhoto?.id === photo.id ? 'active' : ''}`}>
-                  <button className="thumbnail" onClick={() => setSelectedPhotoId(photo.id)}><img src={photo.url} alt="" /><span>{String(index + 1).padStart(2, '0')}</span></button>
+                  <button className="thumbnail" onClick={() => setSelectedPhotoId(photo.id)}><img src={photo.url} alt="" loading="lazy" decoding="async" /><span>{String(index + 1).padStart(2, '0')}</span></button>
                   <button className="thumbnail-remove" onClick={() => removePhoto(photo.id)} aria-label="Remove photo"><Trash2 size={12} /></button>
                 </div>
               ))}
@@ -896,6 +1147,7 @@ function App() {
                     alt={editingPhoto.name || 'Photo being positioned'}
                     style={{ filter: filmStyle(editingPhoto, positionEditor.draft).filter }}
                     draggable="false"
+                    decoding="async"
                   />
                   <div
                     className={`position-crop-selection position-crop-${project.layout}`}
