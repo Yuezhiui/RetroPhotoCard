@@ -1,10 +1,18 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { toPng } from 'html-to-image'
 import {
-  Archive, ArrowLeftRight, Camera, Download, Film, FolderOpen, ImagePlus,
-  Layers3, Redo2, RotateCcw, Save, Settings2, Sparkles, Trash2, Undo2, Upload,
+  Archive, ArrowLeftRight, Camera, Check, Download, Film, FolderOpen, ImagePlus,
+  Layers3, Maximize2, Move, Redo2, RotateCcw, RotateCw, Save, Settings2,
+  Sparkles, Trash2, Undo2, Upload, X, ZoomIn,
 } from 'lucide-react'
 import './App.css'
+
+const defaultTransform = { zoom: 1, x: 0, rotate: 0 }
+const withoutVerticalTransform = (transform = defaultTransform) => ({
+  zoom: Math.max(1, Number(transform.zoom) || 1),
+  x: Number(transform.x) || 0,
+  rotate: Number(transform.rotate) || 0,
+})
 
 const defaultFilm = {
   brightness: 100, contrast: 105, saturation: 100, sepia: 0,
@@ -28,6 +36,14 @@ const layoutOptions = [
   { id: 'editorial', name: 'Editorial', hint: 'Magazine-style cover' },
 ]
 
+const layoutCropRatios = {
+  instant: 0.92,
+  square: 1.11,
+  film: 1.55,
+  postcard: 0.95,
+  editorial: 0.75,
+}
+
 const initialProject = {
   id: '',
   projectName: 'Untitled memory roll',
@@ -41,7 +57,7 @@ const initialProject = {
   frameColor: '#f3eee2',
   inkColor: '#2b2926',
   accentColor: '#b56446',
-  transform: { zoom: 1, x: 0, y: 0, rotate: 0 },
+  transform: { ...defaultTransform },
   film: { ...defaultFilm },
 }
 
@@ -88,12 +104,66 @@ const deleteProjectFromDb = (id) => dbAction('readwrite', (store) => store.delet
 const loadProjectFromDb = (id) => dbAction('readonly', (store) => store.get(id))
 const listProjectsFromDb = () => dbAction('readonly', (store) => store.getAll())
 
-const Slider = ({ label, value, min, max, step = 1, unit = '', onChange }) => (
-  <label className="slider-row">
-    <div className="slider-heading"><span>{label}</span><strong>{value}{unit}</strong></div>
-    <input type="range" min={min} max={max} step={step} value={value} onChange={(event) => onChange(Number(event.target.value))} />
-  </label>
-)
+const Slider = ({ label, value, min, max, step = 1, unit = '', onChange }) => {
+  const [draftValue, setDraftValue] = useState(String(value))
+
+  useEffect(() => {
+    setDraftValue(String(value))
+  }, [value])
+
+  const commitDraftValue = () => {
+    const parsed = Number(draftValue)
+    if (!Number.isFinite(parsed)) {
+      setDraftValue(String(value))
+      return
+    }
+
+    const clamped = Math.max(min, Math.min(max, parsed))
+    const precision = String(step).includes('.') ? String(step).split('.')[1].length : 0
+    const normalized = precision > 0 ? Number(clamped.toFixed(precision)) : Math.round(clamped)
+    onChange(normalized)
+    setDraftValue(String(normalized))
+  }
+
+  return (
+    <label className="slider-row">
+      <div className="slider-heading">
+        <span>{label}</span>
+        <span className="slider-value-editor">
+          <input
+            type="number"
+            min={min}
+            max={max}
+            step={step}
+            value={draftValue}
+            onChange={(event) => setDraftValue(event.target.value)}
+            onBlur={commitDraftValue}
+            onKeyDown={(event) => {
+              if (event.key === 'Enter') {
+                event.preventDefault()
+                event.currentTarget.blur()
+              }
+              if (event.key === 'Escape') {
+                setDraftValue(String(value))
+                event.currentTarget.blur()
+              }
+            }}
+            aria-label={`${label} value`}
+          />
+          {unit && <strong>{unit}</strong>}
+        </span>
+      </div>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(event) => onChange(Number(event.target.value))}
+      />
+    </label>
+  )
+}
 
 function App() {
   const [project, setProject] = useState({ ...initialProject, id: makeId() })
@@ -108,11 +178,15 @@ function App() {
   const [future, setFuture] = useState([])
   const [notice, setNotice] = useState('')
   const [dragState, setDragState] = useState(null)
+  const [positionEditor, setPositionEditor] = useState(null)
+  const [editorDrag, setEditorDrag] = useState(null)
+  const [editorResize, setEditorResize] = useState(null)
   const cardRef = useRef(null)
   const rollRef = useRef(null)
   const importRef = useRef(null)
 
   const selectedPhoto = photos.find((photo) => photo.id === selectedPhotoId) || photos[0] || null
+  const selectedTransform = withoutVerticalTransform(selectedPhoto?.transform || project.transform)
   const allPresets = useMemo(() => [...builtInPresets, ...customPresets], [customPresets])
 
   useEffect(() => {
@@ -135,8 +209,33 @@ function App() {
   }
 
   const patchProject = (patch) => commitProject({ ...project, ...patch })
-  const patchTransform = (patch) => commitProject({ ...project, transform: { ...project.transform, ...patch } })
   const patchFilm = (patch) => commitProject({ ...project, film: { ...project.film, ...patch } })
+
+  const normalizeTransformForPhoto = (photo, currentTransform, patch) => {
+    const next = { ...(currentTransform || defaultTransform), ...patch }
+    next.zoom = Math.max(1, next.zoom || 1)
+    delete next.y
+    next.zoom = Number(Math.min(5, next.zoom).toFixed(2))
+    return next
+  }
+
+  const patchPhotoTransform = (photoId, patch) => {
+    if (!photoId) return
+    setPhotos((items) => items.map((photo) => (
+      photo.id === photoId
+        ? {
+          ...photo,
+          transform: normalizeTransformForPhoto(
+            photo,
+            photo.transform || project.transform || defaultTransform,
+            patch,
+          ),
+        }
+        : photo
+    )))
+  }
+
+  const patchSelectedTransform = (patch) => patchPhotoTransform(selectedPhoto?.id, patch)
 
   const undo = () => {
     if (!past.length) return
@@ -170,7 +269,7 @@ function App() {
       const size = await getImageSize(url)
       nextPhotos.push({
         id: makeId(), url, name: file.name, type: file.type, bytes: file.size,
-        lastModified: file.lastModified, ...size,
+        lastModified: file.lastModified, ...size, transform: { ...defaultTransform },
       })
     }
     setPhotos((items) => [...items, ...nextPhotos])
@@ -197,7 +296,9 @@ function App() {
   const saveCurrentProject = async () => {
     const id = project.id || makeId()
     const normalized = { ...project, id }
-    const payload = { id, project: normalized, photos, selectedPhotoId, updatedAt: new Date().toISOString() }
+    const cleanPhotos = photos.map((photo) => ({ ...photo, transform: withoutVerticalTransform(photo.transform) }))
+    const payload = { id, project: normalized, photos: cleanPhotos, selectedPhotoId, updatedAt: new Date().toISOString() }
+    setPhotos(cleanPhotos)
     setProject(normalized)
     await saveProjectToDb(payload)
     await refreshProjects()
@@ -208,7 +309,10 @@ function App() {
     const payload = await loadProjectFromDb(id)
     if (!payload) return
     setProject(payload.project)
-    setPhotos(payload.photos || [])
+    setPhotos((payload.photos || []).map((photo) => ({
+      ...photo,
+      transform: withoutVerticalTransform(photo.transform || payload.project?.transform),
+    })))
     setSelectedPhotoId(payload.selectedPhotoId || payload.photos?.[0]?.id || null)
     setPast([])
     setFuture([])
@@ -247,7 +351,10 @@ function App() {
       const payload = JSON.parse(await file.text())
       if (!payload.project) throw new Error('Invalid project')
       setProject({ ...initialProject, ...payload.project, id: makeId() })
-      setPhotos(Array.isArray(payload.photos) ? payload.photos : [])
+      setPhotos(Array.isArray(payload.photos) ? payload.photos.map((photo) => ({
+        ...photo,
+        transform: withoutVerticalTransform(photo.transform || payload.project?.transform),
+      })) : [])
       setSelectedPhotoId(payload.selectedPhotoId || payload.photos?.[0]?.id || null)
       setPast([])
       setFuture([])
@@ -267,39 +374,234 @@ function App() {
     flash(`${project.view === 'roll' ? 'Contact sheet' : 'Card'} exported as PNG`)
   }
 
-  const filmStyle = (photo = selectedPhoto) => ({
-    filter: `brightness(${project.film.brightness}%) contrast(${project.film.contrast}%) saturate(${project.film.saturation}%) sepia(${project.film.sepia}%) blur(${project.film.blur}px)`,
-    transform: photo?.id === selectedPhoto?.id
-      ? `translate(${project.transform.x}%, ${project.transform.y}%) scale(${project.transform.zoom}) rotate(${project.transform.rotate}deg)`
-      : 'scale(1.02)',
-  })
+  const filmStyle = (photo = selectedPhoto, transformOverride = null) => {
+    const transform = transformOverride || photo?.transform || project.transform || defaultTransform
+    const sourceRatio = (photo?.width || 1) / (photo?.height || 1)
+    const cropRatio = layoutCropRatios[project.layout] || layoutCropRatios.instant
+    const zoom = Math.max(1, transform.zoom || 1)
+    const normalizedX = Math.max(-1, Math.min(1, (transform.x || 0) / 70))
+    const positionX = 50 + (Math.max(-70, Math.min(70, transform.x)) / 70) * 50
+    const zoomTravel = (zoom - 1) * 50
+    const hasHorizontalSourceTravel = sourceRatio > cropRatio
+    const translateX = hasHorizontalSourceTravel ? 0 : -normalizedX * zoomTravel
+
+    return {
+      filter: `brightness(${project.film.brightness}%) contrast(${project.film.contrast}%) saturate(${project.film.saturation}%) sepia(${project.film.sepia}%) blur(${project.film.blur}px)`,
+      objectPosition: `${hasHorizontalSourceTravel ? positionX : 50}% 50%`,
+      transform: `translateX(${translateX}%) scale(${zoom}) rotate(${transform.rotate || 0}deg)`,
+    }
+  }
+
+  const getCropSelectionGeometry = (photo, transform) => {
+    const sourceRatio = (photo?.width || 1) / (photo?.height || 1)
+    const cropRatio = layoutCropRatios[project.layout] || layoutCropRatios.instant
+    const zoom = Math.max(1, transform?.zoom || 1)
+    let widthFraction = 1
+    let heightFraction = 1
+
+    if (sourceRatio > cropRatio) {
+      widthFraction = cropRatio / sourceRatio
+    } else {
+      heightFraction = sourceRatio / cropRatio
+    }
+
+    widthFraction = Math.min(1, widthFraction / zoom)
+    heightFraction = Math.min(1, heightFraction / zoom)
+
+    const normalizedX = Math.max(-1, Math.min(1, (transform?.x || 0) / 70))
+    const left = ((normalizedX + 1) / 2) * (1 - widthFraction)
+    const top = (1 - heightFraction) / 2
+
+    return { left, top, widthFraction, heightFraction }
+  }
+
+  const getCropSelectionStyle = (photo, transform) => {
+    const { left, top, widthFraction, heightFraction } = getCropSelectionGeometry(photo, transform)
+    return {
+      left: `${left * 100}%`,
+      top: `${top * 100}%`,
+      width: `${widthFraction * 100}%`,
+      height: `${heightFraction * 100}%`,
+      transform: `rotate(${-(transform?.rotate || 0)}deg)`,
+    }
+  }
 
   const handlePointerDown = (event) => {
     if (!selectedPhoto || project.side === 'back') return
     event.currentTarget.setPointerCapture(event.pointerId)
-    setDragState({ x: event.clientX, y: event.clientY, startX: project.transform.x, startY: project.transform.y })
+    setDragState({
+      photoId: selectedPhoto.id,
+      x: event.clientX,
+      startX: selectedTransform.x,
+    })
   }
 
   const handlePointerMove = (event) => {
     if (!dragState) return
     const dx = (event.clientX - dragState.x) / 4
-    const dy = (event.clientY - dragState.y) / 4
-    setProject((current) => ({
-      ...current,
-      transform: {
-        ...current.transform,
-        x: Math.max(-50, Math.min(50, dragState.startX + dx)),
-        y: Math.max(-50, Math.min(50, dragState.startY + dy)),
-      },
-    }))
+    patchPhotoTransform(dragState.photoId, {
+      x: Math.max(-60, Math.min(60, dragState.startX + dx)),
+    })
   }
 
   const handlePointerUp = () => {
     if (!dragState) return
-    setPast((items) => [...items.slice(-39), { ...project, transform: { ...project.transform, x: dragState.startX, y: dragState.startY } }])
-    setFuture([])
     setDragState(null)
   }
+
+  const openPositionEditor = (photo = selectedPhoto) => {
+    if (!photo) return
+    const transform = withoutVerticalTransform(photo.transform || project.transform)
+    setSelectedPhotoId(photo.id)
+    setPositionEditor({ photoId: photo.id, draft: { ...transform } })
+    setEditorDrag(null)
+    setEditorResize(null)
+  }
+
+  const patchEditorTransform = (patch) => {
+    setPositionEditor((current) => {
+      if (!current) return current
+      const photo = photos.find((item) => item.id === current.photoId)
+      return {
+        ...current,
+        draft: normalizeTransformForPhoto(photo, current.draft, patch),
+      }
+    })
+  }
+
+  const closePositionEditor = () => {
+    setPositionEditor(null)
+    setEditorDrag(null)
+    setEditorResize(null)
+  }
+
+  const savePositionEditor = () => {
+    if (!positionEditor) return
+    patchPhotoTransform(positionEditor.photoId, positionEditor.draft)
+    closePositionEditor()
+    flash('Photo position updated')
+  }
+
+  const handleEditorPointerDown = (event) => {
+    if (!positionEditor) return
+    event.currentTarget.setPointerCapture(event.pointerId)
+    const sourceFrame = event.currentTarget.closest('.position-source-frame')
+    const bounds = sourceFrame?.getBoundingClientRect()
+    if (!bounds) return
+    setEditorDrag({
+      x: event.clientX,
+      startX: positionEditor.draft.x,
+      width: bounds.width,
+    })
+  }
+
+  const handleEditorPointerMove = (event) => {
+    if (!editorDrag || !positionEditor) return
+    const dx = ((event.clientX - editorDrag.x) / Math.max(1, editorDrag.width)) * 140
+    patchEditorTransform({
+      x: Math.max(-70, Math.min(70, editorDrag.startX + dx)),
+    })
+  }
+
+  const handleEditorPointerUp = () => setEditorDrag(null)
+
+  const handleEditorResizePointerDown = (event, handle) => {
+    if (!positionEditor || !editingPhoto) return
+    event.stopPropagation()
+    event.currentTarget.setPointerCapture(event.pointerId)
+    const sourceFrame = event.currentTarget.closest('.position-source-frame')
+    const bounds = sourceFrame?.getBoundingClientRect()
+    if (!bounds) return
+
+    setEditorResize({
+      handle,
+      startClientX: event.clientX,
+      startClientY: event.clientY,
+      startZoom: Math.max(1, positionEditor.draft.zoom || 1),
+      startX: positionEditor.draft.x || 0,
+      sourceWidth: bounds.width,
+      sourceHeight: bounds.height,
+      geometry: getCropSelectionGeometry(editingPhoto, positionEditor.draft),
+    })
+    setEditorDrag(null)
+  }
+
+  const handleEditorResizePointerMove = (event) => {
+    if (!editorResize || !positionEditor || !editingPhoto) return
+    event.stopPropagation()
+
+    const { handle, geometry } = editorResize
+    const dx = event.clientX - editorResize.startClientX
+    const dy = event.clientY - editorResize.startClientY
+    const startWidthPx = geometry.widthFraction * editorResize.sourceWidth
+    const startHeightPx = geometry.heightFraction * editorResize.sourceHeight
+    const scaleCandidates = []
+
+    if (handle.includes('e')) {
+      scaleCandidates.push(Math.max(0.08, (startWidthPx + dx) / Math.max(1, startWidthPx)))
+    }
+    if (handle.includes('w')) {
+      scaleCandidates.push(Math.max(0.08, (startWidthPx - dx) / Math.max(1, startWidthPx)))
+    }
+    if (handle.includes('s')) {
+      scaleCandidates.push(Math.max(0.08, (startHeightPx + dy) / Math.max(1, startHeightPx)))
+    }
+    if (handle.includes('n')) {
+      scaleCandidates.push(Math.max(0.08, (startHeightPx - dy) / Math.max(1, startHeightPx)))
+    }
+
+    if (!scaleCandidates.length) return
+    const scaleFactor = scaleCandidates.length === 1
+      ? scaleCandidates[0]
+      : scaleCandidates.reduce((best, value) => (
+        Math.abs(value - 1) > Math.abs(best - 1) ? value : best
+      ), scaleCandidates[0])
+
+    const newZoom = Number(Math.max(1, Math.min(5, editorResize.startZoom / scaleFactor)).toFixed(2))
+    const resizedGeometry = getCropSelectionGeometry(editingPhoto, {
+      ...positionEditor.draft,
+      zoom: newZoom,
+      x: editorResize.startX,
+      y: 0,
+    })
+
+    let targetLeft
+    if (handle.includes('w')) {
+      targetLeft = geometry.left + geometry.widthFraction - resizedGeometry.widthFraction
+    } else if (handle.includes('e')) {
+      targetLeft = geometry.left
+    } else {
+      targetLeft = geometry.left + (geometry.widthFraction - resizedGeometry.widthFraction) / 2
+    }
+
+    const maxLeft = Math.max(0, 1 - resizedGeometry.widthFraction)
+    targetLeft = Math.max(0, Math.min(maxLeft, targetLeft))
+
+    const normalizedX = maxLeft > 0 ? (2 * targetLeft / maxLeft) - 1 : 0
+
+    patchEditorTransform({
+      zoom: newZoom,
+      x: Number((normalizedX * 70).toFixed(2)),
+    })
+  }
+
+  const handleEditorResizePointerUp = (event) => {
+    event.stopPropagation()
+    setEditorResize(null)
+  }
+
+  const handleEditorWheel = (event) => {
+    if (!positionEditor) return
+    event.preventDefault()
+    const direction = event.deltaY > 0 ? -0.08 : 0.08
+    patchEditorTransform({
+      zoom: Math.max(1, Math.min(5, Number((positionEditor.draft.zoom + direction).toFixed(2)))),
+    })
+  }
+
+  const editingPhoto = positionEditor
+    ? photos.find((photo) => photo.id === positionEditor.photoId)
+    : null
 
   const renderPhoto = (photo = selectedPhoto, draggable = true) => (
     <div
@@ -308,6 +610,8 @@ function App() {
       onPointerMove={draggable ? handlePointerMove : undefined}
       onPointerUp={draggable ? handlePointerUp : undefined}
       onPointerCancel={draggable ? handlePointerUp : undefined}
+      onDoubleClick={draggable && photo ? () => openPositionEditor(photo) : undefined}
+      title={draggable && photo ? 'Double-click to position photo' : undefined}
     >
       {photo ? <img src={photo.url} alt={photo.name || 'Memory'} style={filmStyle(photo)} draggable="false" /> : (
         <div className="empty-photo"><Camera size={38} strokeWidth={1.4} /><strong>Add a photo</strong><span>Your memory stays on this device.</span></div>
@@ -395,12 +699,15 @@ function App() {
                   <label className="upload-zone"><ImagePlus size={24} /><strong>Add photos</strong><span>JPG, PNG, WEBP · multiple files supported</span><input type="file" multiple accept="image/*" onChange={handleFiles} /></label>
                 </section>
                 <section>
-                  <div className="section-heading"><div><span>03</span><h3>Frame crop</h3></div><button className="text-button" onClick={() => patchTransform({ zoom: 1, x: 0, y: 0, rotate: 0 })}>Reset</button></div>
-                  <Slider label="Zoom" value={project.transform.zoom} min={0.8} max={2.5} step={0.05} unit="×" onChange={(zoom) => patchTransform({ zoom })} />
-                  <Slider label="Horizontal" value={Math.round(project.transform.x)} min={-50} max={50} unit="%" onChange={(x) => patchTransform({ x })} />
-                  <Slider label="Vertical" value={Math.round(project.transform.y)} min={-50} max={50} unit="%" onChange={(y) => patchTransform({ y })} />
-                  <Slider label="Rotate" value={project.transform.rotate} min={-12} max={12} unit="°" onChange={(rotate) => patchTransform({ rotate })} />
-                  <p className="helper-copy">You can also drag the image directly inside the card.</p>
+                  <div className="section-heading"><div><span>03</span><h3>Frame position</h3></div><button className="text-button" disabled={!selectedPhoto} onClick={() => patchSelectedTransform({ ...defaultTransform })}>Reset</button></div>
+                  <button className="position-photo-button" disabled={!selectedPhoto} onClick={() => openPositionEditor()}>
+                    <Maximize2 size={16} />
+                    <span><strong>Position photo</strong><small>Open the precision editor</small></span>
+                  </button>
+                  <Slider label="Zoom" value={Math.max(1, selectedTransform.zoom)} min={1} max={5} step={0.05} unit="×" onChange={(zoom) => patchSelectedTransform({ zoom })} />
+                  <Slider label="Horizontal" value={Math.round(selectedTransform.x)} min={-70} max={70} unit="%" onChange={(x) => patchSelectedTransform({ x })} />
+                  <Slider label="Rotate" value={selectedTransform.rotate} min={-45} max={45} unit="°" onChange={(rotate) => patchSelectedTransform({ rotate })} />
+                  <p className="helper-copy">Drag directly for quick framing, or double-click the photo to open the precision positioning editor.</p>
                 </section>
                 <section>
                   <div className="section-heading"><div><span>04</span><h3>Paper & ink</h3></div></div>
@@ -523,7 +830,7 @@ function App() {
                 <div ref={cardRef} className={`memory-card layout-${project.layout} side-${project.side}`} style={{ backgroundColor: project.frameColor, color: project.inkColor, '--accent': project.accentColor }}>
                   {project.side === 'front' ? renderFront() : renderBack()}
                 </div>
-                {project.side === 'front' && selectedPhoto && <p className="drag-tip">Drag the photograph to reframe it.</p>}
+                {project.side === 'front' && selectedPhoto && <p className="drag-tip">Drag to reframe · double-click for precision positioning.</p>}
               </div>
             ) : (
               <div className="roll-stage">
@@ -562,6 +869,85 @@ function App() {
           </div>
         </main>
       </div>
+
+      {positionEditor && editingPhoto && (
+        <div className="position-editor-backdrop" role="dialog" aria-modal="true" aria-label="Position photo">
+          <div className="position-editor">
+            <header className="position-editor-header">
+              <div>
+                <span className="position-editor-kicker">FRAME {String(Math.max(0, photos.indexOf(editingPhoto)) + 1).padStart(2, '0')}</span>
+                <h2>Position photo</h2>
+                <p>Drag the image until the crop feels right. Scroll to zoom.</p>
+              </div>
+              <button className="position-close" onClick={closePositionEditor} aria-label="Close position editor"><X size={20} /></button>
+            </header>
+
+            <div className="position-editor-body">
+              <div className="position-canvas">
+                <div className="position-canvas-label"><Move size={14} /> DRAG LEFT / RIGHT</div>
+                <div
+                  className="position-source-frame"
+                  style={{ aspectRatio: `${editingPhoto.width || 16} / ${editingPhoto.height || 9}` }}
+                  onWheel={handleEditorWheel}
+                >
+                  <img
+                    className="position-source-image"
+                    src={editingPhoto.url}
+                    alt={editingPhoto.name || 'Photo being positioned'}
+                    style={{ filter: filmStyle(editingPhoto, positionEditor.draft).filter }}
+                    draggable="false"
+                  />
+                  <div
+                    className={`position-crop-selection position-crop-${project.layout}`}
+                    style={getCropSelectionStyle(editingPhoto, positionEditor.draft)}
+                    onPointerDown={handleEditorPointerDown}
+                    onPointerMove={handleEditorPointerMove}
+                    onPointerUp={handleEditorPointerUp}
+                    onPointerCancel={handleEditorPointerUp}
+                  >
+                    <div className="position-rule rule-v1" /><div className="position-rule rule-v2" />
+                    <div className="position-rule rule-h1" /><div className="position-rule rule-h2" />
+                    {['nw', 'n', 'ne', 'e', 'se', 's', 'sw', 'w'].map((handle) => (
+                      <span
+                        key={handle}
+                        className={`position-handle handle-${handle}`}
+                        onPointerDown={(event) => handleEditorResizePointerDown(event, handle)}
+                        onPointerMove={handleEditorResizePointerMove}
+                        onPointerUp={handleEditorResizePointerUp}
+                        onPointerCancel={handleEditorResizePointerUp}
+                      />
+                    ))}
+                    <div className="position-crop-badge">CARD CROP</div>
+                    <div className="position-rotate-stem" />
+                    <div className="position-rotate-handle"><RotateCw size={14} /></div>
+                  </div>
+                </div>
+                <div className="position-photo-info">
+                  <span>{editingPhoto.name}</span>
+                  <span>{editingPhoto.width || '?'} × {editingPhoto.height || '?'}</span>
+                </div>
+              </div>
+
+              <aside className="position-controls">
+                <div className="position-control-heading"><Maximize2 size={17} /><div><strong>Transform</strong><span>Only this frame is changed</span></div></div>
+                <Slider label="Zoom" value={Math.max(1, positionEditor.draft.zoom)} min={1} max={5} step={0.05} unit="×" onChange={(zoom) => patchEditorTransform({ zoom })} />
+                <Slider label="Horizontal" value={Math.round(positionEditor.draft.x)} min={-70} max={70} unit="%" onChange={(x) => patchEditorTransform({ x })} />
+                <Slider label="Rotate" value={positionEditor.draft.rotate} min={-45} max={45} unit="°" onChange={(rotate) => patchEditorTransform({ rotate })} />
+                <div className="position-shortcuts">
+                  <div><Move size={14} /><span>Drag</span><small>left / right</small></div>
+                  <div><ZoomIn size={14} /><span>Scroll</span><small>zoom photo</small></div>
+                  <div><RotateCw size={14} /><span>Slider</span><small>rotate photo</small></div>
+                </div>
+                <button className="position-reset" onClick={() => patchEditorTransform({ ...defaultTransform })}><RotateCcw size={15} /> Reset position</button>
+                <div className="position-editor-actions">
+                  <button className="ghost-button grow" onClick={closePositionEditor}>Cancel</button>
+                  <button className="primary-button grow" onClick={savePositionEditor}><Check size={16} /> Done</button>
+                </div>
+              </aside>
+            </div>
+          </div>
+        </div>
+      )}
       {notice && <div className="toast">{notice}</div>}
     </div>
   )
