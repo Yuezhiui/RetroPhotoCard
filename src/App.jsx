@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { toBlob } from 'html-to-image'
 import {
-  Archive, ArrowLeftRight, Camera, Check, Download, Film, FolderOpen, ImagePlus,
+  Archive, ArrowLeftRight, CalendarDays, Camera, Check, Download, Film, FolderOpen, ImagePlus,
   Layers3, Maximize2, Move, Redo2, RotateCcw, RotateCw, Save, Settings2,
   Sparkles, Trash2, Undo2, Upload, X, ZoomIn,
 } from 'lucide-react'
@@ -62,6 +62,13 @@ const initialProject = {
 }
 
 const makeId = () => globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`
+
+const getLocalDateValue = (date = new Date()) => {
+  const year = date.getFullYear()
+  const month = String(date.getMonth() + 1).padStart(2, '0')
+  const day = String(date.getDate()).padStart(2, '0')
+  return `${year}-${month}-${day}`
+}
 
 const blobToDataUrl = (blob) => new Promise((resolve, reject) => {
   const reader = new FileReader()
@@ -319,6 +326,7 @@ function App() {
   const importRef = useRef(null)
   const noticeTimeoutRef = useRef(null)
   const exportUrlRef = useRef(null)
+  const dateInputRef = useRef(null)
   const exportInProgressRef = useRef(false)
   const photosRef = useRef([])
   const photoTransformFrameRef = useRef(null)
@@ -352,6 +360,18 @@ function App() {
       setNotice('')
       noticeTimeoutRef.current = null
     }, 2200)
+  }
+
+  const openDatePicker = () => {
+    const input = dateInputRef.current
+    if (!input) return
+    input.focus()
+    try {
+      if (typeof input.showPicker === 'function') input.showPicker()
+      else input.click()
+    } catch {
+      input.click()
+    }
   }
 
   const commitProject = (next) => {
@@ -1004,7 +1024,15 @@ function App() {
                 <section>
                   <div className="section-heading"><div><span>01</span><h3>Front caption</h3></div></div>
                   <label className="field"><span>Title</span><input value={project.title} maxLength={52} onChange={(e) => patchProject({ title: e.target.value })} placeholder="A small moment" /></label>
-                  <label className="field"><span>Date</span><input type="date" value={project.date} onChange={(e) => patchProject({ date: e.target.value })} /></label>
+                  <div className="field">
+                    <label className="field-label" htmlFor="memory-date">Date</label>
+                    <div className="date-field-control">
+                      <input id="memory-date" ref={dateInputRef} type="date" value={project.date || ''} onChange={(e) => patchProject({ date: e.target.value })} />
+                      <button type="button" className="date-picker-button" onClick={openDatePicker} aria-label="Open date picker" title="Open date picker">
+                        <CalendarDays size={16} />
+                      </button>
+                    </div>
+                  </div>
                   <label className="field"><span>Location</span><input value={project.location} maxLength={44} onChange={(e) => patchProject({ location: e.target.value })} placeholder="Somewhere worth remembering" /></label>
                 </section>
                 <section>
@@ -1100,7 +1128,7 @@ function App() {
                       <div className="empty-contact"><Film size={44} /><strong>No frames yet</strong><span>Add several photos to build a contact sheet.</span></div>
                     )}
                   </div>
-                  <div className="contact-footer"><span>{project.date || new Date().toISOString().slice(0, 10)}</span><span>{project.location || 'LOCAL ARCHIVE'}</span></div>
+                  <div className="contact-footer"><span>{project.date || getLocalDateValue()}</span><span>{project.location || 'LOCAL ARCHIVE'}</span></div>
                 </div>
               </div>
             )}
